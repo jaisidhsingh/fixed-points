@@ -1,0 +1,7 @@
+[project]
+name = "fixed-points"
+version = "0.1.0"
+description = "Improving recursive LLMs by inspirations from TRM/HRM"
+readme = "README.md"
+requires-python = ">=3.10.16"
+dependencies = []
