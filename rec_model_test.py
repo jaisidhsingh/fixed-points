@@ -1,6 +1,14 @@
 import torch
+from torch.func import jacrev, vmap
 from nanogpt.recursive_model import RecursiveGPT2, RecursiveGPT2Config
 
+
+def jacobian_op_norm(layer, x):
+    def f(inp):
+        return layer(inp).reshape(-1)
+
+    J = jacrev(f)(x).reshape(x.numel(), x.numel())
+    return torch.linalg.svdvals(J)[0].item()
 
 
 @torch.no_grad()
@@ -40,6 +48,9 @@ def contractive_recursion_test(device):
     
     for lnt in ["pre", "post", "only_rec_out_norm"]:
         config = RecursiveGPT2Config(
+            n_embd=16,
+            block_size=4,
+            vocab_size=4,
             n_layer=n,
             n_prelude_layer=p,
             n_rec_layer=r,
@@ -56,10 +67,24 @@ def contractive_recursion_test(device):
                     x = block(x)
             return x
         
+        class TmpRec(torch.nn.Module):
+            def __init__(self, f):
+                super().__init__()
+                self.f = f
+            
+            def forward(self, x):
+                for i in range(rec_steps):
+                    for block in self.f:
+                        x = block(x)
+                return x
+        
         x = model.forward_through_prelude(idx)
-        contractiveness = finite_diff_jacobian_norm(recursion, x, n_dirs=1)
+        contractiveness = finite_diff_jacobian_norm(recursion, x, n_dirs=100)
+        
+        f = TmpRec(model.transformer.rec_block)
+        c2 = jacobian_op_norm(f, x)
         print("LayerNorm type:", lnt)
-        print("Contrastiveness:", contractiveness)
+        print("Contrastiveness:", contractiveness, c2)
     
     print("\n")
 
@@ -71,6 +96,6 @@ def main(device):
     
 
 if __name__ == "__main__":
-    device = "mps"
+    device = "cpu"
     main(device)
  
