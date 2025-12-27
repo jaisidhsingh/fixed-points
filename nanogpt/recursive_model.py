@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from typing import Annotated, List, Union
 
 import torch
 import torch.nn as nn
@@ -93,17 +94,67 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, norm_placement=None):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.norm_placement = norm_placement if norm_placement is not None else 'pre' # 'pre' is equivalent to the old Block class
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
+        if self.norm_placement in ['pre', 'post']:
+            self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+            self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        elif self.norm_placement in ['post_mlp']:
+            self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        elif self.norm_placement in ['none']:
+            pass
+        else:
+            raise ValueError(f"Block() constructor called with arg norm_placement={norm_placement}. (must be one of: 'post' | 'pre' | 'post_mlp' | 'none')")
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+        # reference - https://arxiv.org/pdf/2002.04745
+        if self.norm_placement in ['pre']:
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
+            return x
+        elif self.norm_placement in ['post']:
+            x = self.ln_1(x + self.attn(x))
+            x = self.ln_2(x + self.mlp(x))
+            return x
+        elif self.norm_placement in ['post_mlp']:
+            x = x + self.attn(x)
+            x = self.ln_2(x + self.mlp(x))
+            return x
+        elif self.norm_placement in ['none']:
+            x = x + self.attn(x)
+            x = x + self.mlp(x)
+            return x
+
+
+def GetRecurrentBlockModuleList(config) -> Annotated[nn.ModuleList, "nn.ModuleList[Block]"]:
+    """
+    Returns a ModuleList[Block].
+    The norm_placement of each block is configured using 'config.rec_norm_kind'.
+    Supports: 'post' | 'pre' | 'none' | 'final_block_out_only'
+    """
+    n_blocks = config.n_rec_layer
+    if config.rec_norm_kind in ['post']:
+        return nn.ModuleList([Block(config, norm_placement='post') for _ in range(n_blocks)])
+    if config.rec_norm_kind in ['pre']:
+        return nn.ModuleList([Block(config, norm_placement='pre') for _ in range(n_blocks)])
+    if config.rec_norm_kind in ['none']:
+        return nn.ModuleList([Block(config, norm_placement='none') for _ in range(n_blocks)])
+    if config.rec_norm_kind in ['final_block_out_only']:
+        return nn.ModuleList([
+                Block(config, norm_placement='none') 
+                for _ in range(n_blocks - 1)
+            ] + [
+                Block(config, norm_placement='post_mlp') 
+                for _ in range(1)
+            ])
+
+
+
+
+
 
 @dataclass
 class RecursiveGPT2Config:
@@ -118,6 +169,7 @@ class RecursiveGPT2Config:
     n_embd: int = 128
     dropout: float = 0.0
     bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    rec_norm_kind: str = 'pre' # applies only to the recurrent looped block. refer to GetRecurrentBlockModuleList
 
 class RecursiveGPT2(nn.Module):
     def __init__(self, config: RecursiveGPT2Config):
@@ -131,7 +183,7 @@ class RecursiveGPT2(nn.Module):
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             prelude = nn.ModuleList([Block(config) for _ in range(config.n_prelude_layer)]),
-            rec_block = nn.ModuleList([Block(config) for _ in range(config.n_rec_layer)]),
+            rec_block = GetRecurrentBlockModuleList(config),
             coda = nn.ModuleList([Block(config) for _ in range(config.n_coda_layer)]),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
