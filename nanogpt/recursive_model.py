@@ -95,14 +95,20 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        if self.config.ln_type == "pre": 
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
+        
+        elif self.config.ln_type == "post":
+            x = self.ln_1(x + self.attn(x))
+            x = self.ln_2(x + self.mlp(x))
         return x
 
 @dataclass
@@ -115,6 +121,8 @@ class RecursiveGPT2Config:
     n_rec_layer: int = 2
     n_coda_layer: int = 1
     stop_grad_rec_ratio: float = 0.8
+    only_rec_out_norm: bool = False
+    ln_type: str = "pre"
     n_embd: int = 128
     dropout: float = 0.0
     bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
@@ -136,6 +144,11 @@ class RecursiveGPT2(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+        
+        if self.config.only_rec_out_norm:
+            self.rec_out_ln = LayerNorm(config.n_embd, bias=config.bias)
+            assert self.config.ln_type != "post", "We don't want Post-LN in the intermediate blocks of the recursive module if `config.only_rec_out_norm == True`"
+        
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -198,6 +211,9 @@ class RecursiveGPT2(nn.Module):
             for block in self.transformer.rec_block:
                 x = block(x)
         
+        if self.config.only_rec_out_norm:
+            x = self.rec_out_ln(x) 
+        
         for block in self.transformer.coda:
             x = block(x)
          
@@ -213,3 +229,19 @@ class RecursiveGPT2(nn.Module):
             loss = None
 
         return logits, loss
+    
+    def forward_through_prelude(self, idx: torch.Tensor):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        
+        for block in self.transformer.prelude:
+            x = block(x)
+        
+        return x
