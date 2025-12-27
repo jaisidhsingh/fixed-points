@@ -1,4 +1,8 @@
+from matplotlib import pyplot as plt
+from tqdm import tqdm
+
 import torch
+from torch.func import jacrev
 from nanogpt.recursive_model import RecursiveGPT2, RecursiveGPT2Config
 
 
@@ -20,6 +24,14 @@ def finite_diff_jacobian_norm(layer, x, eps=1e-4, n_dirs=1):
     return max_gain
 
 
+def jacobian_op_norm(layer, x):
+    def f(inp):
+        return layer(inp).reshape(-1)
+
+    J = jacrev(f)(x).reshape(x.numel(), x.numel())
+    return torch.linalg.svdvals(J)[0].item()
+
+
 def basic_forward_pass_test(device):
     config = RecursiveGPT2Config()
     model = RecursiveGPT2(config).to(device)
@@ -32,14 +44,21 @@ def basic_forward_pass_test(device):
     print("NTP loss:", loss.item(), "\n")
 
 
+
+
 @torch.no_grad()
-def contractive_recursion_test(device):
+def contractive_recursion_test(device, rec_steps=12):
+    fdiff_n_dirs = 100
     n, p, r, c = 8, 2, 4, 2
-    rec_steps = 12
-    print("Contractiveness test for recursive block")
+    n_embd = 128
+    print()
+    print("Contractiveness test for recursive block. rec_steps=", rec_steps, "  n_embd=", n_embd)
     
-    for lnt in ["pre", "post", "only_rec_out_norm"]:
+    ln_types = ["pre", "post", "only_rec_out_norm"]
+    lnt_contractiveness = {}
+    for lnt in ln_types:
         config = RecursiveGPT2Config(
+            n_embd=n_embd,
             n_layer=n,
             n_prelude_layer=p,
             n_rec_layer=r,
@@ -57,18 +76,49 @@ def contractive_recursion_test(device):
             return x
         
         x = model.forward_through_prelude(idx)
-        contractiveness = finite_diff_jacobian_norm(recursion, x, n_dirs=1)
+        contractiveness_fdiff = finite_diff_jacobian_norm(recursion, x, n_dirs=10)
+        contractiveness_jnorm  = jacobian_op_norm(recursion, x)
         print("LayerNorm type:", lnt)
-        print("Contrastiveness:", contractiveness)
-    
-    print("\n")
+        print(f"Contractiveness (finite_diff_jacobian_norm, n_dirs={fdiff_n_dirs}) :", contractiveness_fdiff)
+        print(f"Contractiveness (jacobian_op_norm)                    :", contractiveness_jnorm)
+        print()
+        lnt_contractiveness[lnt] = contractiveness_jnorm
+        
 
+    print("\n")
+    return lnt_contractiveness
+
+
+def contractive_recursion_test_plots(device, savepath=f"contractive_recursion_test_for_different_R.png", display=False):
+    print()
+    print(f"running experiment across different number of rec_steps...")
+    x_rec_steps = []
+    y_post = []
+    y_pre = []
+    y_onlyout = []
+    for rec_steps in range(1, 12):
+        x_rec_steps.append(rec_steps)
+        lnt_j_op_norm = contractive_recursion_test(device, rec_steps)
+        y_post.append(lnt_j_op_norm["post"])
+        y_pre.append(lnt_j_op_norm["pre"])
+        y_onlyout.append(lnt_j_op_norm["only_rec_out_norm"])
+    plt.plot(x_rec_steps, y_post, label="post")
+    plt.plot(x_rec_steps, y_pre, label="pre")
+    plt.plot(x_rec_steps, y_onlyout, label="only_rec_out_norm")
+    plt.legend()
+    plt.xlabel("rec_steps")
+    plt.ylabel("contractiveness (jacobian_op_norm)")
+    plt.savefig(savepath)
+    if display:
+        plt.show()
+    plt.clf()
 
 def main(device):
     torch.manual_seed(0)
     basic_forward_pass_test(device)
     contractive_recursion_test(device)
-    
+    contractive_recursion_test_plots(device, display=True)
+
 
 if __name__ == "__main__":
     device = "mps"
