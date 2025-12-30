@@ -126,9 +126,9 @@ def contractive_recursion_test_plots(device, savepath=f"contractive_recursion_te
 
 def main(device):
     torch.manual_seed(0)
-    basic_forward_pass_test(device)
+    # basic_forward_pass_test(device)
     contractive_recursion_test(device)
-    contractive_recursion_test_plots(device, display=True)
+    # contractive_recursion_test_plots(device, display=True)
 
 
 if __name__ == "__main__":
