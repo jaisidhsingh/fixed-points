@@ -15,6 +15,35 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
+def trunc_normal_init_(tensor: torch.Tensor, std: float = 1.0, lower: float = -2.0, upper: float = 2.0) -> torch.Tensor:
+    # NOTE: PyTorch nn.init.trunc_normal_ is not mathematically correct, the std dev is not actually the std dev of initialized tensor
+    # This function is a PyTorch version of jax truncated normal init (default init method in flax)
+    # https://github.com/jax-ml/jax/blob/main/jax/_src/random.py#L807-L848
+    # https://github.com/jax-ml/jax/blob/main/jax/_src/nn/initializers.py#L162-L199
+
+    with torch.no_grad():
+        if std == 0:
+            tensor.zero_()
+        else:
+            sqrt2 = math.sqrt(2)
+            a = math.erf(lower / sqrt2)
+            b = math.erf(upper / sqrt2)
+            z = (b - a) / 2
+
+            c = (2 * math.pi) ** -0.5
+            pdf_u = c * math.exp(-0.5 * lower ** 2)
+            pdf_l = c * math.exp(-0.5 * upper ** 2)
+            comp_std = std / math.sqrt(1 - (upper * pdf_u - lower * pdf_l) / z - ((pdf_u - pdf_l) / z) ** 2)
+
+            tensor.uniform_(a, b)
+            tensor.erfinv_()
+            tensor.mul_(sqrt2 * comp_std)
+            tensor.clip_(lower * comp_std, upper * comp_std)
+
+    return tensor
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -126,6 +155,8 @@ class RecursiveGPT2Config:
     n_embd: int = 128
     dropout: float = 0.0
     bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    custom_init: bool = False
+
 
 class RecursiveGPT2(nn.Module):
     def __init__(self, config: RecursiveGPT2Config):
@@ -157,11 +188,20 @@ class RecursiveGPT2(nn.Module):
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
-        self.apply(self._init_weights)
+        if not self.config.custom_init:
+            self.apply(self._init_weights_gpt2)
+        else:
+            self.apply(self._init_weights_custom)
+
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                if not self.config.custom_init:
+                    torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                else:
+                    in_dim = p.data.shape[-1]
+                    std = 1.0/(in_dim**0.5)
+                    p.data = trunc_normal_init_(torch.empty_like(p.data), std=std/math.sqrt(2 * config.n_layer))
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -178,7 +218,7 @@ class RecursiveGPT2(nn.Module):
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
-    def _init_weights(self, module):
+    def _init_weights_gpt2(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -186,7 +226,19 @@ class RecursiveGPT2(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, rec_steps: int = 1):
+    def _init_weights_custom(self, module):
+        if isinstance(module, nn.Linear):
+            out_dim, in_dim = module.weight.shape
+            module.weight.data = trunc_normal_init_(torch.empty((out_dim, in_dim)), std=1.0/(in_dim**0.5))
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            module.weight.data = trunc_normal_init_(
+                torch.empty((self.config.vocab_size, self.config.n_embd)), 
+                std=1.0/(self.config.n_embd**0.5)
+            )
+
+    def forward(self, idx: torch.Tensor, targets = None, rec_steps: int = 1):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
