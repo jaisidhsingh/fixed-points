@@ -297,3 +297,167 @@ class RecursiveGPT2(nn.Module):
             x = block(x)
         
         return x
+
+@dataclass
+class TRMCarry:
+    y: torch.Tensor
+    z: torch.Tensor
+
+
+@dataclass
+class TRMConfig:
+    block_size: int = 64
+    vocab_size: int = 512 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 4
+    n_head: int = 1
+    n_prelude_layer: int = 1
+    n_rec_layer: int = 2
+    n_coda_layer: int = 1
+    stop_grad_rec_ratio: float = 0.8
+    only_rec_out_norm: bool = False
+    ln_type: str = "pre"
+    n_embd: int = 128
+    dropout: float = 0.0
+    bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    custom_init: bool = False
+
+
+class TRM(nn.Module):
+    def __init__(self, config: RecursiveGPT2Config):
+        super().__init__()
+        assert config.vocab_size is not None
+        assert config.block_size is not None
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(config.dropout),
+            prelude = nn.ModuleList([Block(config) for _ in range(config.n_prelude_layer)]),
+            rec_block = nn.ModuleList([Block(config) for _ in range(config.n_rec_layer)]),
+            coda = nn.ModuleList([Block(config) for _ in range(config.n_coda_layer)]),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+        ))
+        
+        if self.config.only_rec_out_norm:
+            self.rec_out_ln = LayerNorm(config.n_embd, bias=config.bias)
+            assert self.config.ln_type != "post", "We don't want Post-LN in the intermediate blocks of the recursive module if `config.only_rec_out_norm == True`"
+        
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # with weight tying when using torch.compile() some warnings get generated:
+        # "UserWarning: functional_call was passed multiple values for tied weights.
+        # This behavior is deprecated and will be an error in future versions"
+        # not 100% sure what this is, so far seems to be harmless. TODO investigate
+        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        # init all weights
+        if not self.config.custom_init:
+            self.apply(self._init_weights_gpt2)
+        else:
+            self.apply(self._init_weights_custom)
+
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                if not self.config.custom_init:
+                    torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                else:
+                    in_dim = p.data.shape[-1]
+                    std = 1.0/(in_dim**0.5)
+                    p.data = trunc_normal_init_(torch.empty_like(p.data), std=std/math.sqrt(2 * config.n_layer))
+
+        # report number of parameters
+        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    def get_num_params(self, non_embedding=True):
+        """
+        Return the number of parameters in the model.
+        For non-embedding count (default), the position embeddings get subtracted.
+        The token embeddings would too, except due to the parameter sharing these
+        params are actually used as weights in the final layer, so we include them.
+        """
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer.wpe.weight.numel()
+        return n_params
+
+    def _init_weights_gpt2(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _init_weights_custom(self, module):
+        if isinstance(module, nn.Linear):
+            out_dim, in_dim = module.weight.shape
+            module.weight.data = trunc_normal_init_(torch.empty((out_dim, in_dim)), std=1.0/(in_dim**0.5))
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            module.weight.data = trunc_normal_init_(
+                torch.empty((self.config.vocab_size, self.config.n_embd)), 
+                std=1.0/(self.config.n_embd**0.5)
+            )
+
+    def forward(self, idx: torch.Tensor, targets = None, rec_steps: int = 1):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        
+        for block in self.transformer.prelude:
+            x = block(x)
+        
+        if self.config.stop_grad_rec_ratio > 0 and rec_steps > 1: 
+            with torch.no_grad():
+                no_grad_steps = int(self.config.stop_grad_rec_ratio * rec_steps)
+                for i in range(no_grad_steps):
+                    for block in self.transformer.rec_block:
+                        x = block(x)
+        
+        for j in range(rec_steps - no_grad_steps):
+            for block in self.transformer.rec_block:
+                x = block(x)
+        
+        if self.config.only_rec_out_norm:
+            x = self.rec_out_ln(x) 
+        
+        for block in self.transformer.coda:
+            x = block(x)
+         
+        x = self.transformer.ln_f(x)
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            loss = None
+
+        return logits, loss
+    
+    def forward_through_prelude(self, idx: torch.Tensor):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        
+        for block in self.transformer.prelude:
+            x = block(x)
+        
+        return x
