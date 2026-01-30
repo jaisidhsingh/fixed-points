@@ -140,6 +140,22 @@ class Block(nn.Module):
             x = self.ln_2(x + self.mlp(x))
         return x
 
+class LatentRec(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.fl = Block(config)
+        self.fh = Block(config)
+    
+    def forward(self, x, y, z):
+        n = self.config.n_rec_layer
+        for _ in range(n):
+            print(f"brhu1")
+            z = self.fl(x + y + z) # latent reasoning
+        print("bruh2")
+        y = self.fh(y + z) # refine output answer
+        return y, z
+
 @dataclass
 class RecursiveGPT2Config:
     block_size: int = 64
@@ -258,6 +274,8 @@ class RecursiveGPT2(nn.Module):
                 for i in range(no_grad_steps):
                     for block in self.transformer.rec_block:
                         x = block(x)
+        else:
+            no_grad_steps = 0
         
         for j in range(rec_steps - no_grad_steps):
             for block in self.transformer.rec_block:
@@ -310,12 +328,14 @@ class TRMConfig:
     vocab_size: int = 512 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 4
     n_head: int = 1
-    n_prelude_layer: int = 1
-    n_rec_layer: int = 2
-    n_coda_layer: int = 1
-    stop_grad_rec_ratio: float = 0.8
+    n_prelude_layer: int = 0    # set to 0 for TRM
+    n_rec_layer: int = 6        # this is the n=6 from TRM
+    n_latent_rec: int = 3       # number of times latent_recursion is called. equivalent to T=3 from TRM
+    n_coda_layer: int = 0       # set to 0 for TRM
+    # stop_grad_rec_ratio: float = 0.8  
+    # not needed. in TRM, only last latent_recursion skipped no_grad()
     only_rec_out_norm: bool = False
-    ln_type: str = "pre"
+    ln_type: str = "post"       # TRM uses post-LN for contractivity
     n_embd: int = 128
     dropout: float = 0.0
     bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
@@ -334,10 +354,14 @@ class TRM(nn.Module):
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             prelude = nn.ModuleList([Block(config) for _ in range(config.n_prelude_layer)]),
-            rec_block = nn.ModuleList([Block(config) for _ in range(config.n_rec_layer)]),
+            # rec_block = nn.ModuleList([Block(config) for _ in range(config.n_rec_layer)]),
+            latent_rec = nn.ModuleList([LatentRec(config)] * config.n_latent_rec), # T times latent_recursion calls. 
+            # replace each block in rec_block with a latent_recursion step! 
+            # n layers are identical and the final one is different.
             coda = nn.ModuleList([Block(config) for _ in range(config.n_coda_layer)]),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            # ln_f = LayerNorm(config.n_embd, bias=config.bias), 
+            ln_f = nn.Identity(), # not needed since post-LN already enforced.
         ))
         
         if self.config.only_rec_out_norm:
@@ -402,7 +426,7 @@ class TRM(nn.Module):
                 std=1.0/(self.config.n_embd**0.5)
             )
 
-    def forward(self, idx: torch.Tensor, targets = None, rec_steps: int = 1):
+    def forward(self, idx: torch.Tensor, carry: TRMCarry, targets = None, rec_steps: int = 1):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -416,32 +440,40 @@ class TRM(nn.Module):
         for block in self.transformer.prelude:
             x = block(x)
         
-        if self.config.stop_grad_rec_ratio > 0 and rec_steps > 1: 
+        # get y_init and z_init
+        y, z = carry.z, carry.y
+
+        if rec_steps > 1: 
             with torch.no_grad():
-                no_grad_steps = int(self.config.stop_grad_rec_ratio * rec_steps)
+                no_grad_steps = rec_steps - 1
                 for i in range(no_grad_steps):
-                    for block in self.transformer.rec_block:
-                        x = block(x)
+                    for block in self.transformer.latent_rec:
+                        y, z = block(x, y, z)
+        else:
+            no_grad_steps = 0
         
+        assert no_grad_steps + 1 == rec_steps
+
         for j in range(rec_steps - no_grad_steps):
-            for block in self.transformer.rec_block:
-                x = block(x)
+            for block in self.transformer.latent_rec:
+                y, z = block(x, y, z)
         
         if self.config.only_rec_out_norm:
             x = self.rec_out_ln(x) 
         
-        for block in self.transformer.coda:
-            x = block(x)
-         
-        x = self.transformer.ln_f(x)
+        ##### makes no sense anymore since deep_recursion outputs (y,z) directly fed to lm_head (output_head in TRM algo) to obtain answer instead of reassigning x like in RecursiveGPT2 
+        #for block in self.transformer.coda:
+        #    x = block(x)
+        # 
+        #x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            logits = self.lm_head(y)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(y[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
